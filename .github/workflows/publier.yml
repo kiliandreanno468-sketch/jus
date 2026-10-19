@@ -1,0 +1,42 @@
+name: Publier JUS
+
+on:
+  schedule:
+    - cron: "30 4 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  publier:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploiement.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Copier l'appli
+        run: |
+          mkdir -p _site
+          cp index.html manifest.json sw.js *.png _site/
+      - name: Préparer les bornes et les prix
+        continue-on-error: true
+        run: python3 build_data.py --out _site/data
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deploiement
+        uses: actions/deploy-pages@v4
+
