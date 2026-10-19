@@ -28,48 +28,130 @@ CELL = 0.25  # taille d'une tuile, en degrés
 FRANCE = (41.0, 51.6, -5.5, 10.0)  # lat min, lat max, lon min, lon max (métropole et Corse)
 
 NUM = r"(\d+(?:[.,]\d+)?)"
-EUR = r"\s*(?:€|eur(?:os?)?)\s*(?:ttc\s*)?"
+CUR = r"(?:€|eur(?:os?)?(?![a-z])|e(?![a-zà-ÿ])|cts?(?![a-z])|c€|centimes?)"
+KWH = r"(?:kw\s?/\s?h|k\s?w\s?h|kw)(?=(?:ht|ttc)?(?![a-zà-ÿ]))"
+NODIGIT = r"(?:(?!kw|min|mn)[^\d\n])"
+IDLE = re.compile(r"hors charge|charg[ée]e?\s+mais|est\s+charg[ée]e?\b|apr[eè]s\s+(?:la\s+)?(?:re)?charge|parking|occupation|stationnement|fin de charge|une fois la charge", re.I)
+SEP = re.compile(r",\s|;|\||\+")
 
 
 def fr_num(s):
     return float(s.replace(",", "."))
 
 
+def clean_text(text):
+    t = str(text).replace("\u00a0", " ").replace("\u00e2\u0082\u00ac", "€").replace("â‚¬", "€").replace("\u0080", "€")
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _segment_end(t, i):
+    m = SEP.search(t, i)
+    return m.start() if m else len(t)
+
+
+def _prev_number_end(t, i):
+    last = 0
+    for m in re.finditer(r"\d", t[:i]):
+        last = m.end()
+    return last
+
+
+def _segment_start(t, i):
+    last = 0
+    for m in SEP.finditer(t[:i]):
+        last = m.end()
+    return last
+
+
+def _is_idle(t, m):
+    """Vrai si ce prix au temps concerne l'occupation après la charge (contexte limité à sa propre clause)."""
+    before = t[max(_prev_number_end(t, m.start()), _segment_start(t, m.start())):m.start()]
+    nxt = re.search(r"\d", t[m.end():])
+    stop = m.end() + nxt.start() if nxt else len(t)
+    after = t[m.end():min(stop, _segment_end(t, m.end()), m.end() + 30)]
+    return bool(IDLE.search(before) or IDLE.search(after))
+
+
+def _after(t, m):
+    seg = t[m.end():_segment_end(t, m.end())]
+    a = re.search(r"(?:après|apres|au[- ]del[aà] de|à partir de|a partir de)\s*(\d+)\s*(min|h)", seg, re.I)
+    return int(a.group(1)) * (60 if a.group(2).lower() == "h" else 1) if a else None
+
+
+def _value(num, cur):
+    v = fr_num(num)
+    if cur and re.match(r"c(?:ts?|€|entimes?)", cur, re.I) and v >= 1:
+        v = v / 100
+    return v
+
+
 def parse_tarif(text):
-    """Extrait €/kWh, €/min (et délai), frais de session et gratuité d'un texte libre."""
+    """Extrait €/kWh, €/min (et délai), frais de session et gratuité d'un texte libre d'opérateur."""
     out = {"kwh": None, "min": None, "after": None, "ses": None, "free": False}
     if not text:
         return out
-    t = str(text).replace("\u00a0", " ")
+    t = clean_text(text)
     if re.match(r"^\s*gratuit", t, re.I):
         out["free"] = True
-    m = re.search(NUM + EUR + r"(?:/|par|le)\s*kwh", t, re.I) or re.search(NUM + r"\s*(?:ttc\s*)?/\s*kwh", t, re.I)
-    if m:
-        k = fr_num(m.group(1))
-        if 0.03 < k < 2:
-            out["kwh"] = k
-    m = re.search(NUM + EUR + r"(?:/|par|la)\s*min", t, re.I)
-    if m:
+        return out
+    # Format JSON de certains opérateurs
+    if t.startswith("{") and "energyPrice" in t:
+        m = re.search(r'"energyPrice"\s*:\s*' + NUM, t)
+        if m and 0.03 < fr_num(m.group(1)) < 2:
+            out["kwh"] = fr_num(m.group(1))
+        m = re.search(r'"fixedPrice"\s*:\s*' + NUM, t)
+        if m and 0 < fr_num(m.group(1)) < 20:
+            out["ses"] = fr_num(m.group(1))
+        return out
+    # Prix au kWh
+    for m in re.finditer(NUM + r"\s*(" + CUR + r")?\s*(?:ht|ttc)?" + NODIGIT + r"{0,16}?" + KWH, t, re.I):
+        v = _value(m.group(1), m.group(2))
+        if 0.03 < v < 2:
+            out["kwh"] = round(v, 5)
+            break
+    if out["kwh"] is None:
+        m = re.search(r"per\s+kwh[^:]{0,40}:\s*" + NUM + r"\s*(?:€|eur)", t, re.I)
+        if m and 0.03 < fr_num(m.group(1)) < 2:
+            out["kwh"] = fr_num(m.group(1))
+    if out["kwh"] is None:
+        m = re.match(r"^\s*" + NUM + r"\s*(?:€|e|eur)?\s*(?:ht|ttc)?\s*$", t, re.I)
+        if m and 0.08 <= fr_num(m.group(1)) <= 1.2:
+            out["kwh"] = fr_num(m.group(1))
+    # Prix pendant la charge, à la minute ou à l'heure (les frais d'occupation après la charge sont ignorés)
+    for m in re.finditer(NUM + r"\s*(?:" + CUR + r")?\s*(?:ht|ttc)?\s*(?:ac|dc)?\s*(?:/|par|à la|a la|la)?\s*(?:minute|min|mn)\b", t, re.I):
+        if _is_idle(t, m):
+            continue
         p = fr_num(m.group(1))
         if 0 < p < 2:
             out["min"] = p
+            out["after"] = _after(t, m)
+            break
     if out["min"] is None:
-        m = re.search(NUM + EUR + r"(?:/|par|l')\s*h(?:eure)?\b", t, re.I)
-        if m:
+        for m in re.finditer(NUM + r"\s*(?:€|eur(?:os?)?|e(?![a-zà-ÿ]))\s*(?:ht|ttc)?\s*(?:/|par|l'|de l')\s*h(?:eure)?\b", t, re.I):
+            if _is_idle(t, m):
+                continue
             h = fr_num(m.group(1))
             if 0 < h < 60:
                 out["min"] = round(h / 60, 3)
-    if out["min"] is not None:
-        m = re.search(r"(?:après|apres|au[- ]del[aà] de|au-delà de)\s*(\d+)\s*(min|h)", t, re.I)
-        if m:
-            n = int(m.group(1))
-            out["after"] = n * 60 if m.group(2).lower() == "h" else n
-    m = re.search(NUM + EUR + r"(?:/|par|la)\s*(?:session|charge|recharge|connexion)", t, re.I) or \
-        re.search(r"frais (?:de )?(?:session|connexion|démarrage|demarrage)\s*:?\s*" + NUM, t, re.I)
-    if m:
-        s = fr_num(m.group(1))
-        if 0 < s < 20:
-            out["ses"] = s
+                out["after"] = _after(t, m)
+                break
+    # Frais fixes par session (ignorés s'ils ne valent que sur une plage horaire)
+    pats = [
+        NUM + r"\s*(?:" + CUR + r")?\s*(?:ht|ttc)?" + NODIGIT + r"{0,25}?(?:session|connexion|d[ée]marrage|lancement|d[ée]part|co[uû]t fixe)",
+        r"(?:frais|co[uû]t|prix)\s+(?:fixe\s+)?(?:de\s+)?(?:session|connexion|d[ée]marrage|lancement|d[ée]part)[^\d]{0,30}?" + NUM,
+        NUM + r"\s*(?:€|e)\s*\+\s*\d+(?:[.,]\d+)?\s*(?:€|e)?\s*/\s*" + KWH,
+    ]
+    for pat in pats:
+        for m in re.finditer(pat, t, re.I):
+            seg = t[_prev_number_end(t, m.start()):_segment_end(t, m.end())]
+            if re.search(r"entre\s+\d", seg, re.I) or re.search(r"/\s*" + KWH + r"|/\s*(?:min|mn)\b", t[m.start():m.end()], re.I) and pat is not pats[2]:
+                continue
+            sv = fr_num(m.group(1))
+            if 0 < sv < 20:
+                out["ses"] = sv
+                break
+        if out["ses"] is not None:
+            break
     return out
 
 
