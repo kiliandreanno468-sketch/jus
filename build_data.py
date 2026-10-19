@@ -19,6 +19,7 @@ import math
 import re
 import sys
 import urllib.request
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -108,6 +109,25 @@ def clean(s, limit=160):
     return s[:limit]
 
 
+CITY = r"[A-Za-zÀ-ÿ'’][A-Za-zÀ-ÿ'’ -]{1,}"
+
+
+def city_from(row):
+    """Commune : champ consolidé, sinon après le code postal de l'adresse, sinon en tête du nom de station en majuscules."""
+    c = clean(row.get("consolidated_commune"), 60)
+    if c:
+        return c
+    a = clean(row.get("adresse_station"), 200)
+    m = re.search(r"\b\d{5}\s+(" + CITY + r")", a)
+    if m:
+        return m.group(1).strip(" -,")[:60]
+    n = clean(row.get("nom_station"), 90)
+    m = re.match(r"^([A-ZÀ-Ÿ'’][A-ZÀ-Ÿ'’ -]{2,}?)\s+-\s+", n)
+    if m:
+        return m.group(1).strip()[:60]
+    return ""
+
+
 def cell_key(lat, lon):
     return "%.2f_%.2f" % (math.floor(lat / CELL) * CELL, math.floor(lon / CELL) * CELL)
 
@@ -135,7 +155,7 @@ def build(rows):
             st = stations[key] = {
                 "i": re.sub(r"[^\w-]", "", str(key))[:60], "n": clean(row.get("nom_station"), 90),
                 "e": clean(row.get("nom_enseigne") or row.get("nom_operateur"), 60), "o": clean(row.get("nom_operateur"), 60),
-                "a": clean(row.get("adresse_station"), 120), "c": clean(row.get("consolidated_commune"), 60),
+                "a": clean(row.get("adresse_station"), 120), "c": city_from(row),
                 "la": round(lat, 5), "lo": round(lon, 5), "p": 0, "k": set(), "nb": 0, "rows": 0,
                 "f": False, "cb": False, "h": clean(row.get("horaires"), 60), "t": "", "pr": None, "prkw": -1,
                 "u": clean(row.get("date_maj"), 10),
@@ -170,7 +190,16 @@ def build(rows):
 
     tiles = {}
     stats = {"stations": 0, "pdc": len(seen_pdc), "priced": 0, "free": 0}
+    unparsed, parsed = Counter(), Counter()
+    no_text = 0
     for st in stations.values():
+        if not st["f"]:
+            if st["pr"] is not None:
+                parsed[st["t"]] += 1
+            elif st["t"]:
+                unparsed[st["t"]] += 1
+            else:
+                no_text += 1
         if not st["nb"]:
             st["nb"] = st["rows"]
         order = ["CCS", "CHAdeMO", "T2", "E/F"]
@@ -190,10 +219,15 @@ def build(rows):
         elif "pr" in st:
             stats["priced"] += 1
         tiles.setdefault(cell_key(st["la"], st["lo"]), []).append(st)
-    return tiles, stats
+    diag = {
+        "sans_tarif": no_text, "tarif_illisible": sum(unparsed.values()),
+        "tarifs_illisibles_frequents": unparsed.most_common(150),
+        "tarifs_lus_frequents": [[t, n, parse_tarif(t)] for t, n in parsed.most_common(40)],
+    }
+    return tiles, stats, diag
 
 
-def write(tiles, stats, out_dir, source):
+def write(tiles, stats, out_dir, source, diag=None, columns=None):
     out = Path(out_dir)
     (out / "tiles").mkdir(parents=True, exist_ok=True)
     for old in (out / "tiles").glob("*.json"):
@@ -206,6 +240,9 @@ def write(tiles, stats, out_dir, source):
         "tiles": sorted(tiles.keys()), **stats,
     }
     (out / "index.json").write_text(json.dumps(index, ensure_ascii=False, indent=1), encoding="utf-8")
+    if diag is not None:
+        report = {"generated": index["generated"], "colonnes": columns or [], **stats, **diag}
+        (out / "diagnostic.json").write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
     return index
 
 
@@ -225,12 +262,14 @@ def main():
         source = args.source
     sample = text[:4096]
     delim = ";" if sample.count(";") > sample.count(",") else ","
-    tiles, stats = build(csv.DictReader(io.StringIO(text), delimiter=delim))
+    reader = csv.DictReader(io.StringIO(text), delimiter=delim)
+    tiles, stats, diag = build(reader)
     if stats["stations"] < 1:
         sys.exit("Aucune station lue : format inattendu, données non publiées.")
-    index = write(tiles, stats, args.out, source)
+    index = write(tiles, stats, args.out, source, diag, reader.fieldnames)
     share = 100 * (index["priced"] + index["free"]) / max(1, index["stations"])
     print("%d stations, %d tuiles, prix publié ou gratuit pour %.0f %% des stations" % (index["stations"], len(index["tiles"]), share))
+    print("Sans tarif : %d, tarif présent mais illisible : %d (détail dans data/diagnostic.json)" % (diag["sans_tarif"], diag["tarif_illisible"]))
 
 
 if __name__ == "__main__":

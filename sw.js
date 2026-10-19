@@ -1,4 +1,4 @@
-const CACHE = 'jus-v10';
+const CACHE = 'jus-v11';
 const SHELL = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png', './apple-touch-icon.png'];
 
 self.addEventListener('install', (event) => {

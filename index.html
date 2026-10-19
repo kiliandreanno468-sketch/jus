@@ -704,8 +704,17 @@ input[type="text"], select { font: inherit; color: var(--ink); background: var(-
     if (!s) return 'Station sans nom';
     if (s === s.toUpperCase() && /[A-Z]/.test(s)) {
       s = s.toLowerCase().replace(/(^|[\s\-'’(])([a-zà-ÿ])/g, function (m, a, b) { return a + b.toUpperCase(); });
+      s = s.replace(/([\s-])(Sur|Sous|Le|La|Les|De|Du|Des|En|Et|Lès|Lez|Aux|Au)(?=[\s-])/g, function (m, a, b) { return a + b.toLowerCase(); });
     }
     return s;
+  }
+
+  // Commune : après le code postal de l'adresse, sinon en tête du nom de station en majuscules (« MENUCOURT - Rue… »)
+  function cityFrom(address, name) {
+    var m = String(address || '').match(/\b\d{5}\s+([A-Za-zÀ-ÿ'’][A-Za-zÀ-ÿ'’ -]{1,})/);
+    if (m) return cleanName(m[1].replace(/[\s,-]+$/, ''));
+    m = String(name || '').match(/^([A-ZÀ-Ÿ'’][A-ZÀ-Ÿ'’ -]{2,}?)\s+-\s+/);
+    return m ? cleanName(m[1]) : '';
   }
 
   function splitName(full) {
@@ -731,7 +740,7 @@ input[type="text"], select { font: inherit; color: var(--ink); background: var(-
         s = byId[key] = {
           id: 'irve-' + String(key).replace(/[^\w-]/g, ''), pre: parts.pre, name: parts.name, fullName: full,
           network: cleanName(r.nom_enseigne || r.nom_operateur || 'Réseau inconnu'),
-          operator: r.nom_operateur || '', city: cleanName(r.consolidated_commune || ''), dept: '',
+          operator: r.nom_operateur || '', city: r.consolidated_commune ? cleanName(r.consolidated_commune) : cityFrom(r.adresse_station, r.nom_station), dept: '',
           lat: lat, lon: lon, powerKw: 0, connectors: [], points: 0, rows: 0,
           hours: r.horaires || '', access: r.condition_acces || '',
           cbAccepted: truthy(r.paiement_cb), free: truthy(r.gratuit),
@@ -801,7 +810,7 @@ input[type="text"], select { font: inherit; color: var(--ink); background: var(-
     var parts = splitName(full);
     var s = {
       id: 'irve-' + r.i, pre: parts.pre, name: parts.name, fullName: full,
-      network: cleanName(r.e || r.o || 'Réseau inconnu'), operator: r.o || '', city: cleanName(r.c || ''), dept: '',
+      network: cleanName(r.e || r.o || 'Réseau inconnu'), operator: r.o || '', city: r.c ? cleanName(r.c) : cityFrom(r.a, r.n), dept: '',
       lat: r.la, lon: r.lo, powerKw: r.p || 0, connectors: (r.k || []).slice(), points: r.nb || 1,
       hours: r.h || '', access: '', cbAccepted: !!r.cb, free: !!r.f, address: r.a || '',
       tarifText: r.t || '', updated: r.u || '', source: 'irve'
@@ -875,7 +884,7 @@ input[type="text"], select { font: inherit; color: var(--ink); background: var(-
   }
 
   var api = { load: load, probe: probe, normalize: normalize, parseTarif: parseTarif, url: url, cleanName: cleanName,
-    tilesIndex: tilesIndex, loadTiles: loadTiles, fromCompact: fromCompact, cellKey: cellKey, tiles: T };
+    tilesIndex: tilesIndex, loadTiles: loadTiles, fromCompact: fromCompact, cellKey: cellKey, cityFrom: cityFrom, tiles: T };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.JusLive = api;
 })(typeof window !== 'undefined' ? window : this);
