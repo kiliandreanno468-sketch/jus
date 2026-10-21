@@ -25,7 +25,10 @@ from pathlib import Path
 
 SOURCE = "https://proxy.transport.data.gouv.fr/resource/consolidation-transport-irve-statique"
 # Flux national des états des points de charge (libre, occupé, hors service), rafraîchi en temps réel
-DYN_SOURCE = "https://transport.data.gouv.fr/resources/84098/download"
+DYN_SOURCES = [
+    "https://transport.data.gouv.fr/resources/84098/download",
+    "https://www.data.gouv.fr/api/1/datasets/r/89185b1f-f958-4c5b-9282-399a66ecee97",
+]
 ZONES = {
     "secteur_cergy": (48.95, 49.12, 1.88, 2.20),
     "paris": (48.80, 48.92, 2.22, 2.47),
@@ -450,15 +453,32 @@ def main():
     print("%d stations, %d tuiles, prix publié ou gratuit pour %.0f %% des stations" % (index["stations"], len(index["tiles"]), share))
     print("Sans tarif : %d, tarif présent mais illisible : %d (détail dans data/diagnostic.json)" % (diag["sans_tarif"], diag["tarif_illisible"]))
     # Diagnostic de la disponibilité en direct : ne bloque jamais la publication des bornes
+    out_dispo = Path(args.out) / "diagnostic-dispo.json"
+    essais = []
     try:
-        dyn = Path(args.dynamic_input).read_text(encoding="utf-8-sig") if args.dynamic_input else download(DYN_SOURCE)
+        dyn = None
+        if args.dynamic_input:
+            dyn = Path(args.dynamic_input).read_text(encoding="utf-8-sig")
+        else:
+            for url in DYN_SOURCES:
+                try:
+                    dyn = download(url)
+                    essais.append([url, "ok", len(dyn)])
+                    break
+                except Exception as e:  # noqa: BLE001
+                    essais.append([url, "échec", str(e)[:200]])
+        if dyn is None:
+            raise RuntimeError("flux de disponibilité injoignable")
         rep = dispo_diag(dyn, pdc_map)
-        (Path(args.out) / "diagnostic-dispo.json").write_text(json.dumps(rep, ensure_ascii=False, indent=1), encoding="utf-8")
+        rep["telechargement"] = essais
+        out_dispo.write_text(json.dumps(rep, ensure_ascii=False, indent=1), encoding="utf-8")
         z = rep["zones"]["secteur_cergy"]
         print("Disponibilité en direct : %s %% des stations avec un état de moins d'1 h, %s %% de moins de 10 min (secteur Cergy : %d sur %d)"
               % (rep["pct_stations_moins_1_h"], rep["pct_stations_moins_10_min"], z["etat_moins_1_h"], z["stations"]))
     except Exception as e:  # noqa: BLE001
         print("Diagnostic de disponibilité impossible pour cette fois :", e)
+        out_dispo.write_text(json.dumps({"genere": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "erreur": str(e)[:300], "telechargement": essais},
+                                        ensure_ascii=False, indent=1), encoding="utf-8")
 
 
 if __name__ == "__main__":
