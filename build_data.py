@@ -24,6 +24,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 SOURCE = "https://proxy.transport.data.gouv.fr/resource/consolidation-transport-irve-statique"
+# Flux national des états des points de charge (libre, occupé, hors service), rafraîchi en temps réel
+DYN_SOURCE = "https://transport.data.gouv.fr/resources/84098/download"
+ZONES = {
+    "secteur_cergy": (48.95, 49.12, 1.88, 2.20),
+    "paris": (48.80, 48.92, 2.22, 2.47),
+}
 CELL = 0.25  # taille d'une tuile, en degrés
 FRANCE = (41.0, 51.6, -5.5, 10.0)  # lat min, lat max, lon min, lon max (métropole et Corse)
 
@@ -214,7 +220,7 @@ def cell_key(lat, lon):
     return "%.2f_%.2f" % (math.floor(lat / CELL) * CELL, math.floor(lon / CELL) * CELL)
 
 
-def build(rows):
+def build(rows, pdc_map=None):
     stations = {}
     seen_pdc = set()
     for raw in rows:
@@ -243,6 +249,8 @@ def build(rows):
                 "u": clean(row.get("date_maj"), 10),
             }
         st["rows"] += 1
+        if pdc_map is not None and pdc:
+            pdc_map[pdc] = st
         nb = to_float(row.get("nbre_pdc"))
         if not math.isnan(nb):
             st["nb"] = max(st["nb"], int(nb))
@@ -328,11 +336,99 @@ def write(tiles, stats, out_dir, source, diag=None, columns=None):
     return index
 
 
+def parse_ts(v):
+    v = (v or "").strip()
+    if not v:
+        return None
+    try:
+        d = datetime.fromisoformat(v.replace("Z", "+00:00").replace(" ", "T", 1))
+    except ValueError:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+def dispo_diag(text, pdc_map, now=None):
+    """Mesure ce que vaut le flux de disponibilité : couverture, fraîcheur, états, par zone et par opérateur."""
+    now = now or datetime.now(timezone.utc)
+    sample = text[:4096]
+    reader = csv.DictReader(io.StringIO(text), delimiter=";" if sample.count(";") > sample.count(",") else ",")
+    cols = [(c or "").strip() for c in (reader.fieldnames or [])]
+    def col(*names):
+        for n in names:
+            for c in cols:
+                if n in c.lower():
+                    return c
+        return None
+    c_id, c_etat, c_occ, c_ts = col("id_pdc_itinerance", "id_pdc"), col("etat_pdc"), col("occupation_pdc", "occupation"), col("horodatage")
+    latest, lignes, exemples = {}, 0, []
+    for raw in reader:
+        r = {(k or "").strip(): v for k, v in raw.items()}
+        lignes += 1
+        if len(exemples) < 3:
+            exemples.append({k: (v or "")[:40] for k, v in r.items()})
+        pdc = (r.get(c_id) or "").strip() if c_id else ""
+        if not pdc:
+            continue
+        ts = parse_ts(r.get(c_ts)) if c_ts else None
+        prev = latest.get(pdc)
+        if prev is None or (ts and (prev[0] is None or ts > prev[0])):
+            latest[pdc] = (ts, (r.get(c_etat) or "").strip().lower(), (r.get(c_occ) or "").strip().lower())
+    fraicheur, occupation, etat = Counter(), Counter(), Counter()
+    st_any, st_1h, st_10 = set(), set(), set()
+    relies = 0
+    for pdc, (ts, e, o) in latest.items():
+        age = (now - ts).total_seconds() / 60 if ts else None
+        b = "sans_date" if age is None else "moins_10_min" if age <= 10 else "moins_1_h" if age <= 60 else "moins_24_h" if age <= 1440 else "plus_ancien"
+        fraicheur[b] += 1
+        occupation[o or "vide"] += 1
+        etat[e or "vide"] += 1
+        st = pdc_map.get(pdc)
+        if st is None:
+            continue
+        relies += 1
+        st_any.add(st["i"])
+        if age is not None and age <= 60:
+            st_1h.add(st["i"])
+        if age is not None and age <= 10:
+            st_10.add(st["i"])
+    toutes = {}
+    for st in pdc_map.values():
+        toutes[st["i"]] = st
+    def pct(a, b):
+        return round(100 * a / b, 1) if b else 0
+    zones = {}
+    for name, (la0, la1, lo0, lo1) in ZONES.items():
+        ids = [i for i, st in toutes.items() if la0 <= st["la"] <= la1 and lo0 <= st["lo"] <= lo1]
+        n1h = sum(1 for i in ids if i in st_1h)
+        zones[name] = {"stations": len(ids), "avec_etat": sum(1 for i in ids if i in st_any), "etat_moins_1_h": n1h, "pct_moins_1_h": pct(n1h, len(ids))}
+    ops_total, ops_1h = Counter(), Counter()
+    for i, st in toutes.items():
+        op = st.get("o") or st.get("e") or "Inconnu"
+        ops_total[op] += 1
+        if i in st_1h:
+            ops_1h[op] += 1
+    return {
+        "genere": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "colonnes": cols, "lignes": lignes, "pdc_uniques": len(latest), "pdc_relies_a_une_station": relies,
+        "stations_total": len(toutes), "stations_avec_etat": len(st_any), "stations_etat_moins_1_h": len(st_1h), "stations_etat_moins_10_min": len(st_10),
+        "pct_stations_moins_1_h": pct(len(st_1h), len(toutes)), "pct_stations_moins_10_min": pct(len(st_10), len(toutes)),
+        "fraicheur_des_points": dict(fraicheur), "occupation": dict(occupation.most_common(8)), "etat": dict(etat.most_common(8)), "zones": zones,
+        "operateurs": [[op, n, ops_1h[op], pct(ops_1h[op], n)] for op, n in ops_total.most_common(25)],
+        "exemples": exemples,
+    }
+
+
+def download(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "JUS-donnees/1.0"})
+    with urllib.request.urlopen(req, timeout=300) as res:
+        return res.read().decode("utf-8-sig")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", help="fichier CSV local (sinon téléchargement de la base officielle)")
     ap.add_argument("--source", default=SOURCE)
     ap.add_argument("--out", default="dist/data")
+    ap.add_argument("--dynamic-input", help="fichier CSV local du flux de disponibilité (sinon téléchargement)")
     args = ap.parse_args()
     if args.input:
         text = Path(args.input).read_text(encoding="utf-8-sig")
@@ -345,13 +441,24 @@ def main():
     sample = text[:4096]
     delim = ";" if sample.count(";") > sample.count(",") else ","
     reader = csv.DictReader(io.StringIO(text), delimiter=delim)
-    tiles, stats, diag = build(reader)
+    pdc_map = {}
+    tiles, stats, diag = build(reader, pdc_map)
     if stats["stations"] < 1:
         sys.exit("Aucune station lue : format inattendu, données non publiées.")
     index = write(tiles, stats, args.out, source, diag, reader.fieldnames)
     share = 100 * (index["priced"] + index["free"]) / max(1, index["stations"])
     print("%d stations, %d tuiles, prix publié ou gratuit pour %.0f %% des stations" % (index["stations"], len(index["tiles"]), share))
     print("Sans tarif : %d, tarif présent mais illisible : %d (détail dans data/diagnostic.json)" % (diag["sans_tarif"], diag["tarif_illisible"]))
+    # Diagnostic de la disponibilité en direct : ne bloque jamais la publication des bornes
+    try:
+        dyn = Path(args.dynamic_input).read_text(encoding="utf-8-sig") if args.dynamic_input else download(DYN_SOURCE)
+        rep = dispo_diag(dyn, pdc_map)
+        (Path(args.out) / "diagnostic-dispo.json").write_text(json.dumps(rep, ensure_ascii=False, indent=1), encoding="utf-8")
+        z = rep["zones"]["secteur_cergy"]
+        print("Disponibilité en direct : %s %% des stations avec un état de moins d'1 h, %s %% de moins de 10 min (secteur Cergy : %d sur %d)"
+              % (rep["pct_stations_moins_1_h"], rep["pct_stations_moins_10_min"], z["etat_moins_1_h"], z["stations"]))
+    except Exception as e:  # noqa: BLE001
+        print("Diagnostic de disponibilité impossible pour cette fois :", e)
 
 
 if __name__ == "__main__":
