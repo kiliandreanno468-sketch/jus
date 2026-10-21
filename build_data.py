@@ -452,6 +452,13 @@ def main():
     share = 100 * (index["priced"] + index["free"]) / max(1, index["stations"])
     print("%d stations, %d tuiles, prix publié ou gratuit pour %.0f %% des stations" % (index["stations"], len(index["tiles"]), share))
     print("Sans tarif : %d, tarif présent mais illisible : %d (détail dans data/diagnostic.json)" % (diag["sans_tarif"], diag["tarif_illisible"]))
+    # Carte des points de charge vers les stations, pour le serveur de disponibilité en direct
+    ids, idx, pmap = [], {}, {}
+    for pdc, st in pdc_map.items():
+        if st["i"] not in idx:
+            idx[st["i"]] = len(ids); ids.append(st["i"])
+        pmap[pdc] = idx[st["i"]]
+    (Path(args.out) / "pdc-map.json").write_text(json.dumps({"s": ids, "p": pmap}, separators=(",", ":")), encoding="utf-8")
     # Diagnostic de la disponibilité en direct : ne bloque jamais la publication des bornes
     out_dispo = Path(args.out) / "diagnostic-dispo.json"
     essais = []
