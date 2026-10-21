@@ -219,6 +219,9 @@ def city_from(row):
     return ""
 
 
+FAUX_IDS = {"nonconcerne", "nonapplicable", "na", "nc", "inconnu", "null", "none", "aucun", "sansobjet", "nonrenseigne"}
+
+
 def cell_key(lat, lon):
     return "%.2f_%.2f" % (math.floor(lat / CELL) * CELL, math.floor(lon / CELL) * CELL)
 
@@ -237,7 +240,11 @@ def build(rows, pdc_map=None):
         if pdc:
             seen_pdc.add(pdc)
         lat, lon = pos
-        key = row.get("id_station_itinerance") or "%s|%.5f|%.5f" % (row.get("nom_station", ""), lat, lon)
+        sid = (row.get("id_station_itinerance") or "").strip()
+        # « Non concerné », « NA »… ne sont pas de vrais identifiants : on se rabat sur le nom et la position
+        if len(sid) < 3 or re.sub(r"[^a-z]", "", sid.lower().replace("é", "e")) in FAUX_IDS:
+            sid = ""
+        key = sid or "%s|%.5f|%.5f" % (row.get("nom_station", ""), lat, lon)
         kw = to_float(row.get("puissance_nominale"))
         if not math.isnan(kw) and kw > 1000:
             kw = kw / 1000
